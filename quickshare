@@ -1,0 +1,834 @@
+import machine
+import socket
+import math
+import network
+import time
+import select
+from time import sleep, ticks_ms, ticks_diff
+from umqtt.robust import MQTTClient
+import os
+import gc
+import sys
+import json
+from machine import ADC, Pin, PWM
+from machine import WDT
+sleep(1)#let things boot up and stabilize
+#defaults, these values will be saved and reloaded to flash, if there is no file these will be used:
+persistent_vars_filename = "persistent_vars.json"
+persistent_vars_dict = {"ssid_main_wifi": "CGN-6990",
+                        "password_main_wifi": "244171016736",
+                        "ssid_ap": "PicoW3",
+                        "ap_password" : "123456789",
+                        "ip_leader_mainwifi":'192.168.0.19',
+                        "ip_follower_mainwifi":"192.168.0.16",
+                        "ip_follower_ap":"192.168.4.16",
+                        "ip_leader_ap" : '192.168.4.1',
+                        "phase_order":"IE",
+                        "summer_mode" : 0,
+                        "cfm_limit" : 35,
+                        "cycle_time_ms":30_000, 
+                        "leader_or_follower" : "leader",
+                        "ADAFRUIT_IO_URL" : b'io.adafruit.com',
+                        "ADAFRUIT_USERNAME" : b'adouglas89',
+                        "ADAFRUIT_IO_KEY": b'aio_qmVZ82DsUeQXEeniJ5DMj4908MPt',
+                        "ADAFRUIT_IO_FEEDNAME" : b'OpenERV_TW4-1',
+                        "ADAFRUIT_IO_FEEDNAME_publish" : b'OpenERV_TW4-1_status',
+                        "rps_limit": 250,
+                        "storm_trip_threshold": 0.4,
+                        "s_storm_trip_threshold": 0.2
+                        }
+#non configurable values
+pot = ADC(27)
+
+#transient values that are not saved to flash
+main_cfm = 10
+mqtt_cfm = 0
+leader_main_cfm = 0
+local_pot_cfm = 0
+follower_pot_cfm = 0
+web_config_cfm = 0
+main_rps = 0
+motor_fault = 0
+persistent_var_changed = 0
+storm_bit = 0 
+#there are values used as persistent values in functions although messy this seems to be the only way of getting persistent functions
+last_pot_reading=0
+delta_from_internal_clock = 0
+check_pot_init = 0
+def check_pot(): 
+    #have to have some hysteresis to eliminate noise in the signal, and convert it to a cfm command
+    global last_pot_reading
+    global cfm_limit
+    global check_pot_init
+    current_reading = pot.read_u16()
+    if check_pot_init == 0:
+        last_pot_reading = current_reading
+        check_pot_init = 1
+    if (abs(current_reading-last_pot_reading)>1500): # if it has changed enough since last read
+        last_pot_reading = current_reading
+    cfm = int((last_pot_reading/65535)*cfm_limit)
+    return cfm
+
+def webpage(message):
+    global ssid_main_wifi
+    global password_main_wifi
+    global ssid_ap
+    global ap_password
+    global web_config_cfm 
+    global summer_mode
+    global ip_leader_mainwifi
+    global ip_follower_mainwifi
+    global leader_or_follower
+    global ADAFRUIT_USERNAME
+    global ADAFRUIT_IO_KEY
+    global storm_trip_threshold
+    html = f"""
+            <!DOCTYPE html>
+            <html>
+            <body>
+            Welcome to the OpenERV module configuration page.  You can only set one field at a time.  Changes will be saved automatically and restored between reboots, where appropriate.  Be careful to enter sensible values only, or errors will result.
+            <form>
+              <div>
+                <label for="ssid1">SSID for the home wifi:</label>
+                <input id="ssid_main_wifi" type="text" name="ssid_main_wifi" />
+              </div>
+              <div>
+                <input type="submit" value="Set" />
+              </div>
+            </form>
+
+            <form>
+              <div>
+                <label for="password_main_wifi">password for main wifi:</label>
+                <input id="password_main_wifi" type="text" name="password_main_wifi" />
+              </div>
+              <div>
+                <input type="submit" value="Set" />
+              </div>
+            </form>
+            <form>
+              <div>
+                <label for="ssid_ap">SSID for access point (this has to match for follower and leader):</label>
+                <input id="ssid_ap" type="text" name="ssid_ap" />
+              </div>
+              <div>
+                <input type="submit" value="Set" />
+              </div>
+            </form>
+            <form>
+              <div>
+                <label for="ap_password">password for AP (this has to be the same on follower and leader):</label>
+                <input id=ap_password" type="text" name="ap_password" />
+              </div>
+              <div>
+                <input type="submit" value="Set" />
+              </div>
+            </form>
+
+              <div>
+                <label for="ip_follower_mainwifi">Static IP address of follower be sure to enter a valid one and enter it correctly:</label>
+                <input id="ip_follower_mainwifi" type="text" name="ip_follower_mainwifi" />
+              </div>
+              <div>
+                <input type="submit" value="Set" />
+              </div>
+            </form>
+            <form>
+              <div>
+                <label for="leader_or_follower">leader_or_follower. This must be "leader" or "follower" without the quotes, exactly. </label>
+                <input id="leader_or_follower" type="text" name="leader_or_follower" />
+              </div>
+              <div>
+                <input type="submit" value="Set" />
+              </div>
+            </form>
+            <form>
+              <div>
+                <label for="summer_mode">Summer mode.  Enter a 1 to enable summer mode, and a 0 to disable it (default):</label>
+                <input id="summer_mode" type="text" name="summer_mode" />
+              </div>
+              <div>
+                <input type="submit" value="Set" />
+              </div>
+            </form>
+            <form>
+              <div>
+                <label for="web_config_cfm">CFM level (not saved between reboots) positive for ingress negative for egress, has no effect on follower:</label>
+                <input id="web_config_cfm" type="text" name="web_config_cfm" />
+              </div>
+              <div>
+                <input type="submit" value="Set" />
+              </div>
+            </form>
+                <form>
+              <div>
+                <label for="ip_leader_mainwifi">ip address leader main wifi:</label>
+                <input id="ip_leader_mainwifi" type="text" name="ip_leader_mainwifi" />
+              </div>
+              <div>
+                <input type="submit" value="Set" />
+              </div>
+            </form>
+                <form>
+              <div>
+                <label for="ADAFRUIT_USERNAME">ADAFRUIT_USERNAME:</label>
+                <input id="ADAFRUIT_USERNAME" type="text" name="ADAFRUIT_USERNAME" />
+              </div>
+              <div>
+                <input type="submit" value="Set" />
+              </div>
+            </form>
+                <form>
+              <div>
+                <label for="ADAFRUIT_IO_KEY">ADAFRUIT_IO_KEY:</label>
+                <input id="ADAFRUIT_IO_KEY" type="text" name="ADAFRUIT_IO_KEY" />
+              </div>
+              <div>
+                <input type="submit" value="Set" />
+              </div>
+            </form>
+                <form>
+              <div>
+                <label for="storm_trip_threshold">storm_trip_threshold (number from zero to 1):</label>
+                <input id="storm_trip_threshold" type="text" name="storm_trip_threshold" />
+              </div>
+              <div>
+                <input type="submit" value="Set" />
+              </div>
+            </form>
+                <form>
+              <div>
+                <label for="ADAFRUIT_IO_FEEDNAME">ADAFRUIT_IO_FEEDNAMEb(flow rate commands to the device):</label>
+                <input id="ADAFRUIT_IO_FEEDNAME" type="text" name="ADAFRUIT_IO_FEEDNAME" />
+              </div>
+              <div>
+                <input type="submit" value="Set" />
+              </div>
+            </form>
+                            <form>
+              <div>
+                <label for="ADAFRUIT_IO_FEEDNAME_publish">ADAFRUIT_IO_FEEDNAME_publish (status updates from the device):</label>
+                <input id="ADAFRUIT_IO_FEEDNAME_publish" type="text" name="ADAFRUIT_IO_FEEDNAME_publish" />
+              </div>
+              <div>
+                <input type="submit" value="Set" />
+              </div>
+            </form>
+            
+            <p>diagnostic info: {message}</p>
+            </body>
+            </html>
+            """
+    return html
+def test_ip_legit(string):
+    split = string.split(".")
+    if len(split) == 4:
+        for val in split:
+            if 0<= int(val) <=255:
+                pass
+            else:
+                return False
+        return True
+    else:
+        return False 
+def serve(connection):
+    global ssid_main_wifi
+    global password_main_wifi
+    global ssid_ap
+    global ap_password
+    global web_config_cfm
+    global summer_mode
+    global ip_leader_mainwifi
+    global ip_follower_mainwifi
+    global leader_or_follower
+    global ADAFRUIT_USERNAME
+    global ADAFRUIT_IO_KEY
+    global follower_pot_cfm
+    global main_cfm
+    global storm_trip_threshold
+    global ADAFRUIT_IO_FEEDNAME
+    global ADAFRUIT_IO_FEEDNAME_publish
+    errors = "None"
+    client = connection.accept()[0]
+    request = client.recv(1024)
+    request = str(request)
+    try:
+        request = request.split()[1]
+    except IndexError:
+        pass 
+    print(request)
+    try:
+        if "/?ssid_main_wifi=" in request:
+            preamble_length= len("/ssid_main_wifi=")
+            ssid_main_wifi=request[preamble_length:]
+            save_vars()
+        if "/?password_main_wifi=" in request:
+            preamble_length= len("/?password_main_wifi=")
+            password_main_wifi=request[preamble_length:]
+            save_vars()
+        if "/?ssid_ap=" in request:
+            preamble_length= len("/?ssid_ap=")
+            ssid_ap=request[preamble_length:]
+            save_vars()
+        if "/?ap_password=" in request:
+            preamble_length= len("/?ap_password=")
+            ap_password=request[preamble_length:]
+            save_vars()
+        if "/?ip_leader_mainwifi=" in request:
+            preamble_length= len("/?ip_leader_mainwifi=")
+            cand_ip_leader_mainwifi=request[preamble_length:]
+            if test_ip_legit(cand_ip_leader_mainwifi):
+                ip_leader_mainwifi = cand_ip_leader_mainwifi
+                save_vars()
+        if "/?web_config_cfm=" in request:
+            preamble_length= len("/?web_config_cfm=")
+            web_config_cfm=float(request[preamble_length:])
+            
+        if "/?ip_follower_mainwifi=" in request:
+            preamble_length= len("/?ip_follower_mainwifi=")
+            cand_ip_follower_mainwifi=request[preamble_length:]
+            if test_ip_legit(cand_ip_follower_mainwifi):
+                ip_follower_mainwifi= cand_ip_follower_mainwifi
+                save_vars()
+        if "/?leader_or_follower=" in request:
+            preamble_length= len("/?leader_or_follower=")
+            if request[preamble_length:] == "leader" or request[preamble_length:] == "follower":
+                leader_or_follower=request[preamble_length:]
+                save_vars()
+            else:
+                errors = errors+"the leader or follower appears to not be 'leader' or 'follower'."
+        if "/?summer_mode=" in request:
+            preamble_length= len("/?summer_mode=")
+            summer_mode=int(request[preamble_length:])
+            save_vars()
+        if "/?ADAFRUIT_USERNAME=" in request:
+            preamble_length= len("/?ADAFRUIT_USERNAME=")
+            ADAFRUIT_USERNAME=request[preamble_length:]
+            save_vars()
+        if "/?ADAFRUIT_IO_KEY=" in request:
+            preamble_length= len("/?ADAFRUIT_IO_KEY=")
+            ADAFRUIT_IO_KEY=request[preamble_length:]
+            save_vars()
+        if "/?storm_trip_threshold=" in request:
+            preamble_length= len("/?storm_trip_threshold=")
+            candidate_storm_trip_threshold=float(request[preamble_length:])
+            if 0 <= candidate_storm_trip_threshold <=1:
+                storm_trip_threshold = candidate_storm_trip_threshold
+            else:
+                errors = "it appears the storm trip threshold is invalid."
+            save_vars()
+        if "/?ADAFRUIT_IO_FEEDNAME=" in request:
+            preamble_length= len("/?ADAFRUIT_IO_FEEDNAME=")
+            ADAFRUIT_IO_FEEDNAME=request[preamble_length:]
+            save_vars()
+        if "/?ADAFRUIT_IO_FEEDNAME_publish" in request:
+            preamble_length= len("/?ADAFRUIT_IO_FEEDNAME_publish=")
+            ADAFRUIT_IO_FEEDNAME_publish=request[preamble_length:]
+            save_vars()
+        if "/" in request:
+            send_webpage(errors, client)  
+    except:
+        errors = "something went wrong with accepting the inputs, probably a value was not entered correctly."
+        send_webpage(errors, client)
+    client.close()
+            
+def serve_follower(connection):
+    global main_cfm
+    global follower_pot_cfm
+    client = connection.accept()[0]
+    request = "no reply"
+    try:
+        request = client.recv(1024)
+    except:
+        print("error recieving, probably timeout")
+    request = str(request)
+    print(request)
+    if "What is your status? Here are some values of mine:," in request:
+        print("recieved info from follower:", request)
+        cfm_string = request.split(",")[1][:-1]
+        print("info from follower:",cfm_string)
+        follower_pot_cfm = float(cfm_string)
+        #follower_pot_cfm = float()
+        reply = str(ticks_ms())+","+ str(main_cfm)
+        client.send(reply)
+    else:
+        print("the follower seems to be sending the wrong thing or there is no reply")
+    client.close()
+def run_port_81_communicator(connection):
+    r, w, err = select.select((connection,), (), (), 1)
+    if r:
+        serve_follower(connection)
+    else:
+        print("no follower trying to connect, apparently")
+def send_webpage(errors, client):
+        message= "storm_trip_threshold:"+str(storm_trip_threshold)+" ip_leader_mainwifi:"+ip_leader_mainwifi+" ip_follower_mainwifi:"+ip_follower_mainwifi+" leader_or_follower:"+leader_or_follower+" ADAFRUIT_USERNAME"+ADAFRUIT_USERNAME+" follower_pot_cfm:"+str(follower_pot_cfm)+" ssid_main_wifi: "+ssid_main_wifi+" ssid for ap: "+ssid_ap+" web cfm level: "+str(web_config_cfm)+" summer mode: "+str(summer_mode)+" Errors: "+errors   
+        html=webpage(message)
+        client.send(html)
+        
+def open_socket_server(ip, port):
+    # Open a socket
+    address = (ip, port)
+    connection = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    connection.settimeout(0.4)
+    connection.bind(address)
+    connection.listen(1)
+    print(connection)
+    return(connection)
+
+
+    
+def run_configurator(connection):
+    r, w, err = select.select((connection,), (), (), 1)
+    if r:
+        serve(connection)
+    else:
+        print("nobody trying to connect apparently")
+       
+def connect_wifi(ssid, password):
+    global main_cfm
+    global main_rps
+    wlan = network.WLAN(network.STA_IF)
+    if wlan.active()==True:
+        wlan.active(False)
+    wlan.active(True)
+    wlan.connect(ssid, password)
+    x=0
+    while wlan.isconnected()==False:
+        print("Waiting for connection to network with ssid ",ssid,"...",x)
+        sleep(1)
+        x=x+1
+        led.toggle()
+        wdt.feed()
+        if x>20:
+            print("couldn't connect in ", x , " seconds")
+            
+            return None, None 
+        main_cfm = check_pot()
+        phasey_cfm = phased_cfm(main_cfm,ticks_ms2())
+        main_rps = cfm_to_rps(phasey_cfm,0)
+        print("rps:", main_rps)
+    ip=wlan.ifconfig()
+    print("connected, my address is:",ip[0])
+    return ip[0], wlan
+
+def make_ap(ssid, password):
+    print("making AP with ssid:",ssid," password:",password)
+    ap = network.WLAN(network.AP_IF)
+    ap.config(essid=ssid, password=password) 
+    ap.active(True)
+    while ap.active == False:
+      pass
+    print("Access point active, ip:", ap.ifconfig()[0])
+    return ap.ifconfig()[0]
+
+def cb(topic, msg):# this only gets executed if there is an mqtt message recieved, it's the callback
+    global mqtt_cfm
+    try:
+        cfm = int(str(msg)[2:-1]) # this might not be quite right. it should be a bytes object, so if we convert it to a string chop off extras then int taht should work.
+    except:
+        print("there was no message or it was not a valid integer, message was:",str(msg)[2:-1])
+    else:
+        mqtt_cfm = cfm
+        print("mqtt cfm command recieved:", mqtt_cfm)
+    
+def mqtt_publish(message):
+    global mqtt_feedname_publish
+    client.publish(mqtt_feedname_publish,    
+                   bytes(str(message), 'utf-8'), 
+                   qos=0)
+        
+def save_vars():
+    global persistent_vars_dict
+    vars_dict=persistent_vars_dict
+    global_dict_copy = globals()
+    for key in vars_dict:
+        vars_dict[key] = global_dict_copy[key]   
+    with open(persistent_vars_filename, "w") as outfile:
+         json.dump(vars_dict, outfile)
+         
+def restore_vars():
+    with open(persistent_vars_filename,"r") as openfile:
+        vars_dict = json.load(openfile)
+    globals().update(vars_dict)
+def client_recieve(connection):  # this sets up the socket and sits there and listens for the timeout till it recieves something.
+    try:
+        connection.settimeout(5)
+        message = connection.recv(1024)# 1024 is the size of the buffer, not critical
+        message = str(message)[2:-1] #extra stuff gets tacked on during transmission/reception, chop it off again, we reciever a bytes data type actually and convert to string.
+        connection.close() #gotta close the connection or we can't set up a new one when we want to send stuff
+        return message
+    except BaseException as error: # covers all errors
+        print("error during recieve, probably timeout or something, trying again, error was:", error)
+        
+def client_connect(ip): #
+    address_port = (ip, 81)
+    connection = socket.socket()
+    connection.settimeout(1)
+    print("starting connection")
+    try:
+        connection.connect(address_port)
+    except:
+        print("couldn't connect to leader")
+        connection.close()
+        return None
+    else:
+        return connection
+def update_clock(recieved_time):
+    global delta_from_internal_clock
+    delta_from_internal_clock=time.ticks_diff(time.ticks_ms(),recieved_time) # a positive value means ticks_ms is larger than recieved time
+def ticks_ms2():
+    global delta_from_internal_clock
+    if leader_or_follower == "follower":
+        synched_time = time.ticks_diff(time.ticks_ms(), delta_from_internal_clock)
+        return synched_time
+    if leader_or_follower == "leader":
+        return ticks_ms()
+
+def update_clock(recieved_time):
+    global delta_from_internal_clock
+    delta_from_internal_clock=time.ticks_diff(time.ticks_ms(),recieved_time)
+def client_send_recieve():
+    global leader_main_cfm
+    global ip_leader
+    try:
+        connection=client_connect(ip_leader) # open the port. You can only send once then recieve once, then you have to close and reopen the port
+        if connection == None:
+            return
+        recieve_buffer = None
+        connection.send("What is your status? Here are some values of mine:,"+str(check_pot())) # at the recieving end we will use the split method on the string and take the last element
+        print("status update request sent ok.")
+        recieve_buffer=client_recieve(connection)
+        print("message recieved:", recieve_buffer)
+        if recieve_buffer != None:
+            if len(recieve_buffer) > 4:
+                recieved_items = recieve_buffer.split(",") #split the message so we can get different fields of different length reliably
+                clock_leader = int(recieved_items[0])
+                leader_main_cfm = float(recieved_items[1]) 
+                update_clock(clock_leader)
+    except:
+        print("error during client_send_recieve")
+    finally:
+        try:
+            connection.close()
+        except:
+            print("leader apparently off, could not open connection so can't close it")
+
+last_mqtt_cfm = mqtt_cfm
+last_leader_main_cfm = leader_main_cfm
+last_local_pot_cfm = local_pot_cfm
+last_web_config_cfm = web_config_cfm
+pre_storm_cfm = 0
+cfm = 5
+last_e = 0
+def combine_cfms(a, b, c, d, e):
+    global last_e
+    global last_mqtt_cfm 
+    global last_leader_main_cfm 
+    global last_local_pot_cfm 
+    global last_web_config_cfm
+    global storm_bit
+    global pre_storm_cfm
+    global cfm
+    if abs(last_local_pot_cfm - a)>1:
+        last_local_pot_cfm = a
+        cfm = a
+    if abs(last_mqtt_cfm - b)>1:
+        last_mqtt_cfm = b
+        cfm = b
+    if abs(last_leader_main_cfm - c)>1:
+        last_leader_main_cfm = c
+        cfm = c
+    if abs(last_web_config_cfm - d)>1:
+        last_web_config_cfm = d
+        cfm = d
+    if abs(last_e - e)>1:
+        last_e = e
+        cfm = e
+    
+    pre_storm_cfm = cfm
+    if storm_bit == 1:
+        return 0
+    if storm_bit == 0:
+        return pre_storm_cfm
+def phased_cfm(cfm, clock_time):
+    global leader_or_follower
+    global cycle_time_ms
+    cfm = abs(cfm) #try to reduce complications here, master flow can only be positive during phased operation
+    a = clock_time%cycle_time_ms
+    if a < cycle_time_ms/2:
+        phase = 0
+    if a >= cycle_time_ms/2:
+        phase = 1
+    if leader_or_follower =="leader" and phase == 0: # ingress is positive/supply flow and pressure, egress is negative/subtract
+        cfm = -1*cfm
+        return cfm
+    if leader_or_follower =="leader" and phase == 1:
+        return cfm
+    if leader_or_follower =="follower" and phase == 0:
+        return cfm
+    if leader_or_follower =="follower" and phase == 1:
+        cfm = -1*cfm
+        return cfm
+def cfm_to_rps(cfm_desired,extra_backpressure):#positive backpressure means wind pushing into the building
+    global rps_limit
+    compensation_coefficient = 150 #rps per 1 unit of backpressure, backpressure is in units of pressure the fan can provide at max rps, so full blockage is 1
+    cfm_rps_ratio = 250/35
+    pre_comp_rps = cfm_desired*cfm_rps_ratio#positive cfm, forward positive rps
+    post_comp_rps = pre_comp_rps - compensation_coefficient*extra_backpressure
+    if abs(post_comp_rps) > rps_limit:# this also limits things in the event of excessive cfm command
+        if post_comp_rps > rps_limit:
+            return rps_limit 
+        if post_comp_rps < -1*rps_limit:
+            return -1*rps_limit
+    else:
+        return post_comp_rps
+def push_to_zero(rps):
+    if abs(rps) < 9:
+        rps = 0
+        return rps
+    else:
+        return rps
+old_rps = 0
+rps_changed_clock_in = 0
+def path_clear_for_wind_check():
+    global summer_mode
+    global motor_fault
+    global storm_bit
+    global old_rps
+    global rps_changed_clock_in
+    global main_rps
+    delta_rps = old_rps - main_rps
+    if delta_rps > 0:
+        rps_changed_clock_in=ticks_ms()
+        old_rps = main_rps
+    delta_t_rps_changed = ticks_diff(ticks_ms(),rps_changed_clock_in)
+    if summer_mode == 0:
+        if storm_bit == 0:
+            if delta_t_rps_changed > 2000:
+                return True
+    else:
+        return False
+def check_backpressure():
+    global main_rps
+    if abs(main_rps)<10:# this is the commanded rps not the actual measured rps so it will not transit across zero during acceleration direction change et.
+        return 0 # just say no wind, can't get a good measure and doesn't matter if fan hardly moving. resets the measurement system
+    return 0 # there is nothing here for now as we don't know what driver we are using. it should check rps is valid before measuring backpressure
+
+sd_clock_in = 0
+old_high_pressure_detect_status = 0 
+def storm_detect(backpressure):
+    global sd_clock_in
+    global old_high_pressure_detect_status
+    global storm_trip_threshold 
+    trip_threshold = float(storm_trip_threshold)
+    trip_time_ms = 5000
+    high_pressure_detected = 0
+    if backpressure > trip_threshold :
+        high_pressure_detected = 1
+        print("high air pressure differential detected, probably high wind but could be blockage")
+    if old_high_pressure_detect_status == 0 and high_pressure_detected == 1:
+        sd_clock_in = ticks_ms()
+        old_high_pressure_detect_status = 1
+    if backpressure <= trip_threshold:
+        old_high_pressure_detect_status = 0
+        sd_clock_in = ticks_ms()
+    if ticks_diff(ticks_ms(),sd_clock_in) > trip_time_ms : # if the timer doesn't get reset in long enough time
+        return 1
+    else:
+        return 0
+s_sd_clock_in = 0
+s_old_high_pressure_detect_status = 0
+def s_storm_detect(backpressure):
+    global sd_clock_in
+    global old_high_pressure_detect_status
+    global s_storm_trip_threshold 
+    trip_threshold = s_storm_trip_threshold
+    trip_time_ms = 5000
+    if backpressure > trip_threshold :
+        high_pressure_detected = 1
+        print("summer mode high air pressure differential detected, probably high wind but could be blockage")
+    if s_old_high_pressure_detect_status == 0 and high_pressure_detected == 1:
+        s_sd_clock_in = ticks_ms()
+        s_old_high_pressure_detect_status = 1
+    if backpressure <= trip_threshold:
+        s_old_high_pressure_detect_status = 0
+        s_sd_clock_in = ticks_ms()
+    if ticks_diff(ticks_ms(),s_sd_clock_in) > trip_time_ms : # if the timer doesn't get reset in long enough time
+        return 1
+    else:
+        return 0
+old_bit = 0
+st_check_clock_in = 0
+def time_since_last_storm_detect(storm_bit):
+    global old_bit
+    global st_check_clock_in
+    if old_bit == 0 and storm_bit == 1:
+        st_check_clock_in = ticks_ms()
+        old_bit = storm_bit
+    return ticks_diff(ticks_ms(),st_check_clock_in)
+def close_valve(): # this all assumes the frequency is 50 hz, the servos actually go by pulse width but we can only specify duty cycle in code
+    closed_position = 1140
+    open_position = 2900
+    if abs (servo.duty_u16() - closed_position) < 100: # if it's already closed don't do anything
+        return
+    for i in range(open_position, closed_position, -50):
+        servo.duty_u16(i)
+        sleep(0.02)
+def open_valve():
+    closed_position = 1140
+    open_position = 2900
+    if abs (servo.duty_u16() - open_position) < 100:# if it's already open then don't do anything
+        return
+    for i in range(closed_position, open_position, 50):
+        servo.duty_u16(i)
+        sleep(0.02)
+        
+
+def leader_follower_changed_reboot(val):
+    global old_val_l_or_f_transition
+    if val == old_val_l_or_f_transition:
+        return
+    else:
+        sleep(10) # the watchdog will reset, max time for wdt is 8.3 seconds, the watchdog gives a more complete reset than machine.reset()
+#initialization
+wdt = WDT(timeout = 8000)
+led=machine.Pin('LED', machine.Pin.OUT)
+ip = None
+globals().update(persistent_vars_dict)
+root_files = os.listdir('/')
+if 'persistent_vars.json' not in root_files: # if the file doesn't exist then create it with the defaults.
+    save_vars()
+restore_vars()
+old_val_l_or_f_transition = leader_or_follower
+if leader_or_follower == "follower":
+    while True:# keep looping till you connect to something
+        ip, wlan=connect_wifi(ssid_main_wifi,password_main_wifi)
+        if ip != None: #if it connected to main wifi
+            print("old ifconfig",wlan.ifconfig())
+            tuple_ip_mask =(ip_follower_mainwifi,'255.255.255.0')
+            new_ifconfig = tuple_ip_mask+wlan.ifconfig()[2:4]
+            wlan.ifconfig(new_ifconfig)
+            ip=wlan.ifconfig()[0]
+            print('updated ifconfig, ip: ',ip)
+            ip_leader = ip_leader_mainwifi
+            break
+        if ip == None: #if it couldn't connect to main wifi, try the backup ap
+            ip, wlan=connect_wifi(ssid_ap,ap_password)           
+        if ip != None: #must have connected to ap
+            ip_leader = ip_leader_ap
+            print("old ifconfig",wlan.ifconfig())
+            tuple_ip_mask =(ip_follower_ap,'255.255.255.0')
+            new_ifconfig = tuple_ip_mask+wlan.ifconfig()[2:4]
+            wlan.ifconfig(new_ifconfig)
+            ip=wlan.ifconfig()[0]
+            print('updated ifconfig, ip: ',ip)
+            break
+        #there needs to be some basic code here to check the pot and change direction so it still works in a basic way with no connection but later will confuse debugging anyway
+if leader_or_follower == "leader":
+    ip, wlan=connect_wifi(ssid_main_wifi,password_main_wifi)
+    if ip != None:#it connected to main wifi
+        print("old ifconfig",wlan.ifconfig())
+        tuple_ip_mask =(ip_leader_mainwifi,'255.255.255.0')
+        new_ifconfig = tuple_ip_mask+wlan.ifconfig()[2:4]
+        wlan.ifconfig(new_ifconfig)
+        ip=wlan.ifconfig()[0]
+        print('updated ifconfig, ip: ',ip) 
+    if ip == None:#if it failed to connect to main wifi
+        ip = make_ap(ssid_ap, ap_password)
+    mqtt_feedname = bytes('{:s}/feeds/{:s}'.format(ADAFRUIT_USERNAME, ADAFRUIT_IO_FEEDNAME), 'utf-8')
+    mqtt_feedname_publish = bytes('{:s}/feeds/{:s}'.format(ADAFRUIT_USERNAME, ADAFRUIT_IO_FEEDNAME_publish), 'utf-8')
+    random_num = int.from_bytes(os.urandom(3), 'little')
+    mqtt_client_id = bytes('client_'+str(random_num), 'utf-8')
+    client = MQTTClient(client_id=mqtt_client_id, 
+                        server=ADAFRUIT_IO_URL, 
+                        user=ADAFRUIT_USERNAME, 
+                        password=ADAFRUIT_IO_KEY,
+                        ssl=False)
+    client.set_callback(cb)
+    try:
+        print("about to start mqtt connection")
+        wdt.feed()
+        client.connect()
+        mqtt_connected = 1
+        print("mqtt connected ok! Recieve feed name:", ADAFRUIT_IO_FEEDNAME, "Status updates feedname:",ADAFRUIT_IO_FEEDNAME_publish)
+    except Exception as e:
+        mqtt_connected = 0
+        print('could not connect to MQTT server, oserror -1 or -2 means the adafruit server is not working right: {}{}'.format(type(e).__name__, e))
+    if mqtt_connected == 1:
+        client.subscribe(mqtt_feedname)
+
+connection=open_socket_server(ip, 80)
+wdt.feed()
+connection_port_81=open_socket_server(ip, 81)
+servo = PWM(Pin(12))
+servo.freq(50)
+comm_loop_timer = ticks_ms()
+comm_loop_timer2 = ticks_ms()
+backpressure = 0 
+#main loop:
+while True:
+    try:
+        if ticks_diff(ticks_ms(),comm_loop_timer) > 2500:#cannot communicate with mqtt server more than 30 times per minute
+                comm_loop_timer = ticks_ms()
+                if leader_or_follower == "leader":
+                    if mqtt_connected == 1:
+                        try:
+                            mqtt_publish(ticks_ms())
+                            client.check_msg() #if changed from follower to leader this will cause an error, just let it go and let the watchdog reboot.
+                        except:
+                            print("error during effort to communicate over mqtt")
+                run_configurator(connection)
+        if ticks_diff(ticks_ms(),comm_loop_timer2)>300:#cannot communicate with mqtt server more than 30 times per minute
+                comm_loop_timer2 = ticks_ms()
+                if leader_or_follower == "leader":
+                    run_port_81_communicator(connection_port_81)
+                if leader_or_follower == "follower":
+                    client_send_recieve()
+                run_configurator(connection)
+    except:
+        print("some kind of communication error, this is common as these things are unreliable, gotta keep going")
+    local_pot_cfm = check_pot()
+    if leader_or_follower == "leader":
+        main_cfm = combine_cfms(a=local_pot_cfm, b=mqtt_cfm, c=leader_main_cfm, d=web_config_cfm, e = follower_pot_cfm)
+    if leader_or_follower == "follower":
+        main_cfm = combine_cfms(a=0, b=0, c=leader_main_cfm, d=0, e = 0)
+    print("main_rps:", main_rps, " main_cfm:", main_cfm," commloop:",ticks_diff(ticks_ms(),comm_loop_timer))
+    if path_clear_for_wind_check():
+        print("path clear for backpressure check")
+        backpressure = check_backpressure()
+        if summer_mode == 0:
+            storm_bit = storm_detect(backpressure)
+        if summer_mode == 1:
+            storm_bit = s_storm_detect(backpressure)
+    if summer_mode == 0:
+        phasey_cfm = phased_cfm(main_cfm,ticks_ms2())
+        main_rps = cfm_to_rps(phasey_cfm,backpressure)
+    if summer_mode == 1:
+        main_rps = cfm_to_rps(main_cfm,0) 
+    if time_since_last_storm_detect(storm_bit) > 20*60*1000: # if it's more than 20 minutes since last storm detection,
+        storm_bit = 0
+    main_rps = push_to_zero(main_rps)
+    if main_rps == 0:
+        close_valve()
+    else:
+        open_valve()
+    leader_follower_changed_reboot(leader_or_follower)
+    sleep(0.2)
+    wdt.feed()
+    
+        
+    
+
+
+
+
+
+
+
+
+
+
+
+
+
+
